@@ -140,3 +140,7 @@ python3 tests/mutation_sweep.py  # 19 个变异体，必须 19/19 变红
 CI：`.github/workflows/tests.yml` 在每次 push 和 pull request 上跑两步——先是 135 个用例的
 测试套件，然后是 19 个变异体的变异测试（任何一个变异体没被测试抓住就判失败）。两步都必须绿。
 只用 Python 标准库，不装依赖、不联网、不下模型。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。字幕和摘要是你自己跑出来的产物，版权归原视频作者，本许可证不涉及。
