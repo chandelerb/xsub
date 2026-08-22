@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 测试套件只用标准库，并在 sys.modules 里假冒 yt_dlp / mlx_whisper，
+      # 所以不需要装任何依赖，也不会真的联网下载。
+      - name: Run xsub test suite
+        run: python3 tests/test_xsub.py
+      # 变异测试：把每条保护单独拆掉一次，确认测试会变红。
+      - name: Run mutation sweep
+        run: python3 tests/mutation_sweep.py
