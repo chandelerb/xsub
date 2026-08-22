@@ -137,11 +137,6 @@ python3 tests/mutation_sweep.py  # 19 个变异体，必须 19/19 变红
 绿了就说明那条保护没有任何用例盯住，随时可能在下次重构里被悄悄删掉而没人发现。
 它在临时目录里改拷贝，不会动到本仓库。
 
-CI 现状（如实说明）：`.github/workflows/tests.yml` 已配置为每次 push 和 PR 触发，但**到目前为止
-一次都没真正跑过测试**。根因已查明，且**不在本仓库的代码或工作流配置里**：GitHub 返回的
-job 注解是「The job was not started because recent account payments have failed or your spending
-limit needs to be increased.」——即账号侧的付款失败或用量上限，runner 根本没有分配。
-所以 job 在执行任何一个 step 之前就结束，日志端点自然返回 `BlobNotFound`（没有日志可取）。
-已在三次独立的 run（push 与 pull_request 两种触发都有）上看到同一条注解。
-在账号计费恢复之前，改工作流文件不会有任何帮助；
-**不能把 CI 当成绿色证据**，测试结果目前只有作者本机的运行记录。
+CI：`.github/workflows/tests.yml` 在每次 push 和 pull request 上跑两步——先是 135 个用例的
+测试套件，然后是 19 个变异体的变异测试（任何一个变异体没被测试抓住就判失败）。两步都必须绿。
+只用 Python 标准库，不装依赖、不联网、不下模型。
