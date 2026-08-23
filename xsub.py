@@ -11,7 +11,7 @@ xsub — 从 X(Twitter) / YouTube 视频链接提取完整字幕并生成中文�
 用法:
   xsub <链接> [<链接> ...]
   xsub <链接> --no-summary           # 只出字幕，不生成摘要（内容完全不外发）
-  xsub <链接> --native-subs          # 优先用平台自带字幕（快，但质量随平台）
+  xsub <链接> --native-subs          # 优先用平台自带字幕（YouTube 用；X 本就是默认）
   xsub <链接> --cookies               # 强制借用 Chrome 登录态（仅登录可见/年龄限制的内容）
   xsub <链接> --force                 # 忽略缓存，重新下载+转写
 
@@ -30,9 +30,12 @@ xsub — 从 X(Twitter) / YouTube 视频链接提取完整字幕并生成中文�
   summary.md         中文学习摘要（claude -p 生成，走 Claude Code 登录态，无需 API key）
   summary.meta.json  摘要与字幕的绑定指纹
 
-字幕来源: 默认一律**本地 Whisper 转写**（两个平台一致、结果可预期）。
-  加 --native-subs 才会优先用平台自带字幕：人工字幕优先，自动字幕只认「原语言轨」
-  （YouTube 的 <语言>-orig），绝不使用机器翻译轨；挑不出可靠的轨就退回本地转写。
+字幕来源: 两个平台的默认值**不同**，这是刻意的：
+  X/Twitter   默认优先用平台自带字幕（与本工具一贯行为一致，取轨规则逐字未变）。
+  YouTube     默认本地 Whisper 转写；它的 automatic_captions 是"一条原件 + 一百多条
+              机翻"，滚动式自动字幕质量也参差。加 --native-subs 才会去用平台字幕，
+              且自动字幕**只认原语言轨**（<语言>-orig），绝不使用机器翻译轨；
+              挑不出可靠的轨就退回本地转写。
 
 隐私提示: 下载与转写全程本地完成；生成摘要时 transcript.md 会通过 `claude -p`
 发送给 Anthropic（走你的 Claude Code 订阅登录态，消耗订阅额度，不使用 API key）。
@@ -47,6 +50,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -78,6 +82,11 @@ PLATFORM_YOUTUBE = "youtube"
 # 塞进上下文——真跑起来是先烧掉几十分钟，再在最后一步超时或超上下文。
 # 与其那样，不如在**下载之前**就说清楚。--allow-long-video 可以显式放行。
 MAX_DURATION_SEC = 2 * 3600
+
+# --allow-long-video 放行的是"比默认长"，不是"无限长"。没有第二道上限，那个开关就等于
+# 把闸门整个拆掉：一场 12 小时的直播回放照样会进来，本地转写跑到天亮。
+# 同时它也是 duration 缺失时的显式 override 边界——放行也只放行到这里为止。
+HARD_MAX_DURATION_SEC = 6 * 3600
 
 X_HOSTS = frozenset(
     {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.x.com", "mobile.twitter.com"}
@@ -321,9 +330,17 @@ def parse_youtube_url(raw: str) -> tuple[str, str, int | None]:
     elif len(segments) >= 2 and segments[0] in YT_PATH_KINDS:
         video_id = segments[1]
 
-    if video_id.lower() == "videoseries":
+    if (
+        len(segments) >= 2
+        and segments[0] == "embed"
+        and video_id.lower() == "videoseries"
+    ):
         # /embed/videoseries?list=<PLAYLIST> 是播放列表的嵌入写法。字面量 "videoseries"
         # 恰好是 11 位合法字符，能原样通过 ID 形态校验，然后被当成真视频 ID 送去 yt-dlp。
+        #
+        # 只在 /embed/ 这条路径上拒。"videoseries" 在别处没有这层含义：它同时也是一个
+        # 形态完全合法的 11 位视频 ID，无条件拒会把 /watch?v=videoseries 这样一个
+        # 可能真实存在的视频挡在门外，还给出一句"这是 /embed/ 链接"的错误说明。
         raise XsubError(
             "这是一个播放列表的嵌入链接（/embed/videoseries），xsub 一次只处理一个视频。"
             f"请改用其中单个视频的链接（.../watch?v=<视频ID>）: {raw}"
@@ -722,11 +739,18 @@ def card_target(
 
 
 def guard_youtube_admission(info: dict, video_id: str, allow_long: bool) -> None:
-    """下载之前先判断这个视频**值不值得开工**：直播和超长视频一律拒。
+    """下载之前先判断这个视频**值不值得开工**：直播、超长、以及时长不明的一律拒。
 
     直播没有终点，下载会一直挂着；直播预告根本没有内容。超长视频则是转写跑几十
     分钟之后才在摘要那一步炸掉。两种都在拿到 metadata 的当下就能看出来，
     没有理由让人先等着。
+
+    时长不明（duration 缺失、非数值、NaN/inf、<=0）与"超长"同等对待：判断不了就不放行。
+    放行未知等于把上限整个绕过去——最坏情况和不设上限一模一样，只是多了一层"看起来
+    检查过了"的错觉。想跑就显式加 --allow-long-video 承担后果。
+
+    即便加了 --allow-long-video，HARD_MAX_DURATION_SEC 这道硬上限仍然生效：
+    显式放行是"我知道它长"，不是"多长都行"。
     """
     status = str(info.get("live_status") or "").strip()
     if info.get("is_live") or status in ("is_live", "is_upcoming", "post_live"):
@@ -735,11 +759,35 @@ def guard_youtube_admission(info: dict, video_id: str, allow_long: bool) -> None
             "等它转成回放之后再跑。"
         )
     dur = info.get("duration")
-    if not allow_long and isinstance(dur, (int, float)) and dur > MAX_DURATION_SEC:
+    known = (
+        isinstance(dur, (int, float))
+        and not isinstance(dur, bool)
+        and math.isfinite(dur)
+        and dur > 0
+    )
+    if not known:
+        # 时长未知就放行，等于把上限当不存在：直播回放、分段缺失、yt-dlp 拿不到
+        # duration 的畸形条目，全都会以"没超上限"的名义进来，然后在下载和转写上
+        # 烧掉几十分钟。拿不到证据时不放行——这是 fail-closed，不是保守。
+        if not allow_long:
+            raise XsubError(
+                f"拿不到这个视频的时长（duration={dur!r}，id={video_id}），无法判断是否超过 "
+                f"{MAX_DURATION_SEC // 3600} 小时上限，拒绝继续。"
+                "确认要跑请加 --allow-long-video（建议同时加 --no-summary）。"
+            )
+        return
+    if not allow_long and dur > MAX_DURATION_SEC:
         raise XsubError(
             f"视频时长 {dur / 3600:.1f} 小时，超过 {MAX_DURATION_SEC / 3600:.0f} 小时上限。"
             "本地转写会跑很久，摘要那一步还可能超上下文。"
             "确认要跑请加 --allow-long-video（建议同时加 --no-summary）。"
+        )
+    if dur > HARD_MAX_DURATION_SEC:
+        # --allow-long-video 放行的是"比默认长"，不是"无限长"。这道上限不可绕过：
+        # 再往上就不是"跑得久一点"，而是一整夜的转写加一次必定超上下文的摘要。
+        raise XsubError(
+            f"视频时长 {dur / 3600:.1f} 小时，超过 {HARD_MAX_DURATION_SEC / 3600:.0f} 小时的"
+            "硬上限，--allow-long-video 也不放行。请改用视频的分段版本，或自行截取音频。"
         )
 
 
@@ -1052,10 +1100,7 @@ def match_lang_track(langs: list[str], target: str, orig_only: bool = False) -> 
     优先级：原语言轨(`xx-orig`) > 精确匹配 > 同语族前缀(en 匹配 en-US)。
     原语言轨排第一：它是 ASR 直出的原件，其余同语言轨可能是从别的语言机翻过来的。
 
-    orig_only=True 时**只认原语言轨**，挑不到就返回 None（退回本地转写）。
-    调用方在"这张轨道表里出现过 -orig"时置位——那是 YouTube 机翻扇出的特征签名：
-    此时同名的 `en` 轨不是英文原件，而是从原语言机翻过去的译件。降级到精确匹配
-    等于拿一份机翻当原文，字幕和摘要都会是二手转述。
+    orig_only=True 时**只认原语言轨**，挑不到就返回 None（调用方退回本地转写）。
     """
     base = target.lower().split("-")[0]
     orig = [l for l in langs if l.lower() == f"{base}{ORIG_TRACK_SUFFIX}"]
@@ -1069,17 +1114,51 @@ def match_lang_track(langs: list[str], target: str, orig_only: bool = False) -> 
     return None
 
 
-def pick_native_lang(info: dict, want: str | None) -> tuple[str, str] | None:
-    """在 subtitles / automatic_captions 里挑一条字幕轨，返回 (lang, kind)。
+def _pick_lang_legacy(info: dict, want: str | None) -> tuple[str, str] | None:
+    """X 的取轨规则——与本工具一贯行为**逐字相同**，不要"顺手改进"它。
 
     人工字幕优先于自动字幕。指定 --lang 时只认该语言（en 可匹配 en-US），
     没有就返回 None 交给本地转写——而不是拿一条语言不对的字幕糊弄过去。
 
-    **没有任何语言依据时一律返回 None**（旧版取 sorted(langs)[0]）。
-    旧行为在 YouTube 上是灾难性的：automatic_captions 有 160 条轨，字母序第一条是
-    `aa`（阿法尔语机翻）。一条英文视频会拿到一份机翻阿法尔语字幕，还报"成功"。
-    人工字幕表小得多，但同样赌不起——两条以上又说不出该要哪条时，退回本地转写
-    才是对的：慢一点，但结果是对的。
+    X 的字幕表是创作者上传的少数几条人工轨，取错的余地小；而任何改动都会让所有
+    老目录的缓存失效、结果跟着变。YouTube 的问题（一张表一百多条机翻轨）不在这条
+    路径上，所以修 YouTube 不该动 X——两边分成两个函数，就是为了让这件事在代码里
+    看得见，而不是靠一个"表里有没有 -orig"的运行期签名去猜自己身在哪个平台。
+    """
+    for kind, key in (("平台字幕", "subtitles"), ("平台自动字幕", "automatic_captions")):
+        tracks = info.get(key)
+        if not isinstance(tracks, dict) or not tracks:
+            continue
+        langs = sorted(tracks)
+        if want:
+            exact = [l for l in langs if l.lower() == want.lower()]
+            prefix = [l for l in langs if l.lower().split("-")[0] == want.lower().split("-")[0]]
+            chosen = exact or prefix
+            if not chosen:
+                continue
+            return chosen[0], kind
+        preferred = info.get("language")
+        if preferred and preferred in tracks:
+            return preferred, kind
+        return langs[0], kind
+    return None
+
+
+def _pick_lang_youtube(info: dict, want: str | None) -> tuple[str, str] | None:
+    """YouTube 的取轨规则：宁可退回本地转写，也不拿一份机翻当原文。
+
+    与 X 的规则有三处**刻意**的不同，每一处都对着 YouTube 的一个真实形态：
+
+    1. `automatic_captions` **只认原语言轨**（`<语言>-orig`），而且这条限制按**平台**
+       生效，不看那张表里当时有没有 `-orig`。按"表里出现过 -orig"这个签名开关是不牢的：
+       yt-dlp 版本、地区、视频年代都会改变表的形状，一旦某次返回的表里只剩普通的 `en`，
+       签名式的门就自己开了——而那条 `en` 完全可能是从别的语言机翻过去的。
+       按平台判定，这个门对 YouTube 自动字幕永远关着。
+    2. 没有语言依据（既没有 --lang，info 里也没有 language）时返回 None，不取字母序第一条。
+       automatic_captions 有一百六十来条轨，字母序第一条是 `aa`（阿法尔语机翻）——
+       一条英文视频会拿到一份机翻阿法尔语字幕，还报"成功"。
+    3. 人工字幕表没有语言依据时，只有**唯一一条**才用：创作者只上传了这一份，
+       不存在挑错的余地；两条以上又说不出该要哪条，退回本地转写才是对的。
     """
     spoken = str(info.get("language") or "").strip() or None
     target = want or spoken
@@ -1089,23 +1168,29 @@ def pick_native_lang(info: dict, want: str | None) -> tuple[str, str] | None:
             continue
         langs = sorted(tracks)
         if target:
-            # 自动字幕表里出现 -orig 轨 == 这份表是"原件 + 一百多条机翻"的扇出。
-            # 这个签名只在 YouTube 的 automatic_captions 上出现：X 的字幕表没有
-            # -orig，人工字幕表也没有，所以这两处的取轨规则逐字不变。
-            orig_only = key == "automatic_captions" and any(
-                l.lower().endswith(ORIG_TRACK_SUFFIX) for l in langs
-            )
-            chosen = match_lang_track(langs, target, orig_only=orig_only)
+            chosen = match_lang_track(langs, target, orig_only=key == "automatic_captions")
             if chosen:
                 return chosen, kind
             continue
         if key == "automatic_captions":
-            # 自动字幕表里绝大多数是机翻轨，没有语言依据时挑哪条都是赌
             continue
         if len(langs) == 1:
-            # 只有一条人工字幕轨：创作者上传的就这一份，不存在挑错的余地
             return langs[0], kind
     return None
+
+
+def pick_native_lang(
+    info: dict, want: str | None, platform: str = PLATFORM_X
+) -> tuple[str, str] | None:
+    """在 subtitles / automatic_captions 里挑一条字幕轨，返回 (lang, kind)。
+
+    取轨规则**按平台分岔**：两个平台的字幕表根本不是一种东西，理由见两个
+    `_pick_lang_*` 的 docstring。platform 默认 PLATFORM_X，因为 X 那条是既有行为。
+    """
+    if platform == PLATFORM_YOUTUBE:
+        return _pick_lang_youtube(info, want)
+    return _pick_lang_legacy(info, want)
+
 
 
 def fetch_native_subs(
@@ -1115,6 +1200,7 @@ def fetch_native_subs(
     want_lang: str | None,
     retry: CookieRetry,
     download_info: dict | None = None,
+    platform: str = PLATFORM_X,
 ) -> tuple[list[dict], str, str] | None:
     """X 自带字幕（罕见）。有则直接用，省掉转写。返回 (segs, lang, source)。
 
@@ -1122,7 +1208,7 @@ def fetch_native_subs(
     都下到同一个 native.* 模板上，谁最后写谁算数，最终字幕可能属于另一个视频。
     所以只要这个 target 带 download_info，就必须走条目级的 info 下载。
     """
-    picked = pick_native_lang(info, want_lang)
+    picked = pick_native_lang(info, want_lang, platform)
     if not picked:
         return None
     lang, kind = picked
@@ -1186,6 +1272,16 @@ VTT_TS = re.compile(
     r"(?:(\d{1,4}):)?(\d{1,2}):(\d{2})[.,](\d{1,3})\s*-->\s*(?:(\d{1,4}):)?(\d{1,2}):(\d{2})[.,](\d{1,3})"
 )
 
+# cue 的时间行：整行就是"起 --> 止"，后面最多再跟一串 cue settings（align:start 之类）。
+# 用它做 fullmatch，而不是拿 VTT_TS 在任意行里 search——正文里出现时间戳形状的文本
+# 是合法的，search 会把那一行误当成新 cue 的开头，把前半段正文连同时间一起丢掉。
+VTT_TS_LINE = re.compile(
+    r"[ \t]*(?:(\d{1,4}):)?(\d{1,2}):(\d{2})[.,](\d{1,3})"
+    r"[ \t]*-->[ \t]*"
+    r"(?:(\d{1,4}):)?(\d{1,2}):(\d{2})[.,](\d{1,3})"
+    r"(?:[ \t]+\S.*?)?[ \t]*"
+)
+
 
 def _vtt_seconds(h, m, s, ms) -> float:
     return int(h or 0) * 3600 + int(m) * 60 + int(s) + int(str(ms).ljust(3, "0")) / 1000
@@ -1210,13 +1306,19 @@ def split_vtt_cues(text: str) -> list[tuple[float, float, list[str]]]:
       - 滚动字幕用"只含一个空格的行"表示滚动窗口的上一行此刻为空，
         它不是分隔符，却会把一条 cue 从中间劈开（时间戳一半、正文一半，两半都被丢）；
       - 缺失空行的手写 vtt 会让下一条的时间戳被当成上一条的正文吞掉。
-    时间戳行本身就是无歧义的分界，直接用它。
+
+    但"是不是时间戳行"必须按 WebVTT 的**整行语法**判定，不能拿 `search()` 在行里找。
+    正文里出现时间戳形状的文本是完全合法的（"他说 00:00:02.000 --> 00:00:03.000 是时间码"），
+    用 search() 就会把这一行当成新 cue 的开头：cue 被从中间劈开，前半段的正文
+    连同它自己的时间一起消失。整行匹配（时间戳 + 可选的 cue settings，此外别无他物）
+    没有这个歧义。
     """
     lines = [l.rstrip("\r") for l in text.splitlines()]
-    ts_at = [i for i, l in enumerate(lines) if VTT_TS.search(l)]
+    hits = [(i, VTT_TS_LINE.fullmatch(l)) for i, l in enumerate(lines)]
+    ts_at = [(i, m) for i, m in hits if m]
     cues: list[tuple[float, float, list[str]]] = []
-    for n, i in enumerate(ts_at):
-        stop = ts_at[n + 1] if n + 1 < len(ts_at) else len(lines)
+    for n, (i, m) in enumerate(ts_at):
+        stop = ts_at[n + 1][0] if n + 1 < len(ts_at) else len(lines)
         body = lines[i + 1 : stop]
         # WebVTT 的 cue 标识符是紧贴下一条时间戳、且与本条正文之间隔着空行的那一行。
         # 它属于下一条 cue，不是本条的正文。
@@ -1224,7 +1326,7 @@ def split_vtt_cues(text: str) -> list[tuple[float, float, list[str]]]:
             body = body[:-1]
         while body and not body[-1].strip():
             body.pop()
-        g = VTT_TS.search(lines[i]).groups()
+        g = m.groups()
         cues.append((_vtt_seconds(*g[:4]), _vtt_seconds(*g[4:]), body))
     return cues
 
@@ -1237,11 +1339,16 @@ def parse_vtt(text: str) -> list[dict]:
 
         00:05.080 --> 00:07.709
         do                       <- 重抄上一条，不是新内容
-        it<00:06.080><c> just</c><00:06.680><c> do</c>
+        it<00:06.080><c> just</c>
 
-    去重按**内容**做，不按标签做：一行的去标签文本如果和紧邻的前几行产出一字不差，
-    它就是重抄。这比"只保留带标签的行"稳——后者会把同一条 cue 里没打标签的真正文
-    一起丢掉，而滚动文件的第一条 cue 恰恰就是没有标签的。
+    认"重抄"要同时看两件事，缺一不可：
+      - 去标签后的文本与紧邻的前几行一字不差；
+      - 这一行**自己不带词级时间标签**。
+
+    第二条是关键。词级标签是"这些字此刻正在被说出来"的记号，重抄行从来不带它
+    （上面的 `do` 就是），带标签的那一行永远是本条 cue 的新内容。只按文本相等去重，
+    连着说两遍的同一句话（"No!" "No!"，各带各的词级时间）就会被删掉一句，
+    而那是真实语音，不是重绘。
 
     两道限制保证普通字幕**逐字不受影响**：
       - 整份文件里出现过词级标签才启用（人工字幕一个都没有）；
@@ -1253,32 +1360,42 @@ def parse_vtt(text: str) -> list[dict]:
     recent: list[str] = []  # 最近产出过的行文本，用来认出重抄
     prev_end: float | None = None
     for start, end, body in cues:
-        plain = [TAG_RE.sub("", l).strip() for l in body]
-        plain = [x for x in plain if x]
-        if rolling:
-            contiguous = prev_end is not None and start - prev_end <= ROLLING_JOIN_MAX_GAP_SEC
-            prev_end = end
-            if not contiguous:
-                recent.clear()  # 时间上断开了，此后的重复都是真重复
-            fresh = [x for x in plain if x not in recent] if contiguous else plain
-            filler = end - start <= ROLLING_FILLER_MAX_SEC and not any(
-                INLINE_TS_RE.search(l) for l in body
-            )
-            if not fresh or filler:
-                # 整条都是重抄（过渡 cue 就长这样）：不产出新段，但这段时间里
-                # 屏幕上显示的还是上一句，所以把上一段的结束时间延伸过来，
-                # 而不是让这段时长凭空消失。
-                if segs:
-                    segs[-1]["end"] = max(segs[-1]["end"], end)
-                continue
-            recent.extend(fresh)
-            del recent[:-ROLLING_WINDOW_LINES]
-            plain = fresh
-        body_text = re.sub(r"\s+", " ", " ".join(plain)).strip() if rolling else " ".join(plain)
-        body_text = TAG_RE.sub("", body_text).strip()
+        if not rolling:
+            # 非滚动路径与本工具一贯的解析**逐字相同**：整条 cue 的正文行原样拼起来，
+            # 去标签，只做首尾 strip。行内与行间的空白照原样留着——那是字幕作者排的版。
+            body_text = TAG_RE.sub("", " ".join(l for l in body if l.strip())).strip()
+            if body_text:
+                segs.append({"start": start, "end": end, "text": body_text})
+            continue
+        # (去标签文本, 这一行自己带不带词级时间标签)
+        pairs = [(TAG_RE.sub("", l).strip(), bool(INLINE_TS_RE.search(l))) for l in body]
+        pairs = [(t, tagged) for t, tagged in pairs if t]
+        contiguous = prev_end is not None and start - prev_end <= ROLLING_JOIN_MAX_GAP_SEC
+        prev_end = end
+        if not contiguous:
+            recent.clear()  # 时间上断开了，此后的重复都是真重复
+        fresh = (
+            [t for t, tagged in pairs if tagged or t not in recent]
+            if contiguous
+            else [t for t, _ in pairs]
+        )
+        filler = end - start <= ROLLING_FILLER_MAX_SEC and not any(
+            tagged for _, tagged in pairs
+        )
+        if not fresh or filler:
+            # 整条都是重抄（过渡 cue 就长这样）：不产出新段，但这段时间里
+            # 屏幕上显示的还是上一句，所以把上一段的结束时间延伸过来，
+            # 而不是让这段时长凭空消失。
+            if segs:
+                segs[-1]["end"] = max(segs[-1]["end"], end)
+            continue
+        recent.extend(fresh)
+        del recent[:-ROLLING_WINDOW_LINES]
+        body_text = re.sub(r"\s+", " ", " ".join(fresh)).strip()
         if body_text:
             segs.append({"start": start, "end": end, "text": body_text})
     return segs
+
 
 
 # ---------------------------------------------------------------- whisper
@@ -1809,10 +1926,10 @@ def process_media(target: MediaTarget, args, retry: CookieRetry) -> RunResult:
             native = None
             if policy == SUBTITLE_POLICY_NATIVE_FIRST:
                 native = fetch_native_subs(
-                    info, url, out_dir, args.lang, retry, target.download_info
+                    info, url, out_dir, args.lang, retry, target.download_info, target.platform
                 )
             else:
-                available = pick_native_lang(info, args.lang)
+                available = pick_native_lang(info, args.lang, target.platform)
                 if available:
                     log(
                         f"检测到{available[1]}（{available[0]}），但默认走本地转写；"
@@ -1881,7 +1998,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--allow-long-video",
         action="store_true",
-        help=f"放行超过 {MAX_DURATION_SEC // 3600} 小时的 YouTube 视频（默认拒绝）",
+        help=f"放行超过 {MAX_DURATION_SEC // 3600} 小时、或时长未知的 YouTube 视频（默认拒绝；{HARD_MAX_DURATION_SEC // 3600} 小时硬上限仍生效）",
     )
     return ap
 

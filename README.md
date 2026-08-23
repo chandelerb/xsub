@@ -174,19 +174,19 @@ X 允许一条推文放多个视频，网页上的链接末尾会带 `/video/1`�
 ## 自动化测试
 
 ```bash
-python3 tests/test_xsub.py       # 191 个用例
-python3 tests/mutation_sweep.py  # 42 个变异体，必须 42/42 变红
+python3 tests/test_xsub.py       # 209 个用例
+python3 tests/mutation_sweep.py  # 50 个变异体，必须 50/50 变红
 ```
 
-191 个用例，只用 Python 标准库：`yt_dlp` / `mlx_whisper` / `claude` 全部在测试里被假冒，
+209 个用例，只用 Python 标准库：`yt_dlp` / `mlx_whisper` / `claude` 全部在测试里被假冒，
 不联网、不下模型、不产生任何费用。
 
 `mutation_sweep.py` 是「测试的测试」：它把每一条保护单独拆掉一次，看测试会不会变红。
 绿了就说明那条保护没有任何用例盯住，随时可能在下次重构里被悄悄删掉而没人发现。
 它在临时目录里改拷贝，不会动到本仓库。
 
-CI：`.github/workflows/tests.yml` 在每次 push 和 pull request 上跑两步——先是 191 个用例的
-测试套件，然后是 42 个变异体的变异测试（任何一个变异体没被测试抓住就判失败）。两步都必须绿。
+CI：`.github/workflows/tests.yml` 在每次 push 和 pull request 上跑两步——先是 209 个用例的
+测试套件，然后是 50 个变异体的变异测试（任何一个变异体没被测试抓住就判失败）。两步都必须绿。
 只用 Python 标准库，不装依赖、不联网、不下模型。
 
 ## 许可证

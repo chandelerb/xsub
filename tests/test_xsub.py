@@ -566,34 +566,42 @@ class TestVttParsing(unittest.TestCase):
         self.assertIsNone(xsub.pick_native_lang({"subtitles": {}}, None))
 
     def test_lang_selection_refuses_to_gamble_without_evidence(self):
-        """没有任何语言依据时宁可退回本地转写，也不按字母序抓一条。
+        """YouTube 上没有任何语言依据时宁可退回本地转写，也不按字母序抓一条。
 
-        旧版取 sorted(langs)[0]。在 YouTube 上这是灾难：automatic_captions 有 160 条轨，
-        字母序第一条是 aa（阿法尔语机翻），一条英文视频会配上一份阿法尔语字幕还报成功。
+        automatic_captions 有 160 条轨，字母序第一条是 aa（阿法尔语机翻），
+        一条英文视频会配上一份阿法尔语字幕还报成功。
+        这条严格规则**只对 YouTube**；X 的取轨行为另有专门用例锁定。
         """
+        yt = xsub.PLATFORM_YOUTUBE
         many = {"subtitles": {"zh": [{}], "en": [{}], "ar": [{}]}}
-        self.assertIsNone(xsub.pick_native_lang(many, None), "多条人工轨又说不出要哪条 → 不赌")
+        self.assertIsNone(xsub.pick_native_lang(many, None, yt), "多条人工轨又说不出要哪条 → 不赌")
         auto_only = {"automatic_captions": {"aa": [{}], "en": [{}], "zh": [{}]}}
-        self.assertIsNone(xsub.pick_native_lang(auto_only, None), "自动字幕表没有依据时一律不选")
+        self.assertIsNone(
+            xsub.pick_native_lang(auto_only, None, yt), "自动字幕表没有依据时一律不选"
+        )
 
         # 有语言依据就必须挑得出来，且多次调用结果稳定
         with_lang = {**many, "language": "zh"}
         for _ in range(3):
-            self.assertEqual(xsub.pick_native_lang(with_lang, None), ("zh", "平台字幕"))
+            self.assertEqual(xsub.pick_native_lang(with_lang, None, yt), ("zh", "平台字幕"))
         # 只有一条人工字幕轨：创作者上传的就这一份，不存在挑错的余地
-        self.assertEqual(xsub.pick_native_lang({"subtitles": {"ar": [{}]}}, None), ("ar", "平台字幕"))
+        self.assertEqual(
+            xsub.pick_native_lang({"subtitles": {"ar": [{}]}}, None, yt), ("ar", "平台字幕")
+        )
 
     def test_original_language_track_beats_machine_translated_ones(self):
         """YouTube 的 `<语言>-orig` 是 ASR 原件，同名无后缀轨可能是机翻，必须优先原件。"""
+        yt = xsub.PLATFORM_YOUTUBE
         info = {"language": "en", "automatic_captions": {"aa": [{}], "en": [{}], "en-orig": [{}], "ja": [{}]}}
-        self.assertEqual(xsub.pick_native_lang(info, None), ("en-orig", "平台自动字幕"))
-        self.assertEqual(xsub.pick_native_lang(info, "en"), ("en-orig", "平台自动字幕"))
+        self.assertEqual(xsub.pick_native_lang(info, None, yt), ("en-orig", "平台自动字幕"))
+        self.assertEqual(xsub.pick_native_lang(info, "en", yt), ("en-orig", "平台自动字幕"))
 
     def test_machine_translated_track_is_not_used_for_a_foreign_video(self):
         """日语视频里那条 `en` 是机翻。要 en 就只能给 en，绝不能把 ja-orig 当成 en。"""
+        yt = xsub.PLATFORM_YOUTUBE
         info = {"language": "ja", "automatic_captions": {"en": [{}], "ja-orig": [{}]}}
-        self.assertEqual(xsub.pick_native_lang(info, None), ("ja-orig", "平台自动字幕"))
-        self.assertEqual(xsub.pick_native_lang(info, "fr"), None)
+        self.assertEqual(xsub.pick_native_lang(info, None, yt), ("ja-orig", "平台自动字幕"))
+        self.assertEqual(xsub.pick_native_lang(info, "fr", yt), None)
 
 
 class TestRunResultReporting(unittest.TestCase):
@@ -732,6 +740,8 @@ class FakeTwitter:
     CARDS: list = []
     # 外链播放器地址 → 由别的提取器返回的结果
     EXTERNAL: dict = {}
+    # 额外并进每个视频 entry 的字段（如 subtitles / language）。默认空 = 其余用例逐字不变。
+    ENTRY_EXTRA: dict = {}
 
     def __init__(self):
         self.extract_calls = []
@@ -846,6 +856,7 @@ class FakeTwitter:
             "upload_date": "20260101",
             "duration": 12.0,
             "formats": [{"url": f"https://video.example/{media_id}.m4a"}],
+            **self.ENTRY_EXTRA,
         }
 
     def _extract(self, url, opts):
@@ -890,7 +901,8 @@ class FakeTwitterCase(unittest.TestCase):
             sys.modules["yt_dlp"] = self._saved
 
     @staticmethod
-    def _subs_per_media(info, url, out_dir, want_lang, retry, download_info=None):
+    def _subs_per_media(info, url, out_dir, want_lang, retry, download_info=None,
+                        platform=xsub.PLATFORM_X):
         """平台字幕替身：内容里带 media_id，串了就一眼看得出来。"""
         return [{"start": 0.0, "end": 1.0, "text": f"字幕属于 {info['id']}"}], "en", "平台字幕:en"
 
@@ -1168,8 +1180,10 @@ class TestE3EntryLevelIsolation(FakeTwitterCase):
         self.tw.CARDS = [self.SUBBED_A, self.SUBBED_B]
         real = xsub.fetch_native_subs
 
-        def url_level(info, url, out_dir, want_lang, retry, download_info=None):
-            return real(info, url, out_dir, want_lang, retry, None)  # 故意丢掉条目级隔离
+        def url_level(info, url, out_dir, want_lang, retry, download_info=None,
+                      platform=xsub.PLATFORM_X):
+            # 故意丢掉条目级隔离
+            return real(info, url, out_dir, want_lang, retry, None, platform)
 
         with TempDir() as root:
             results = self._run_native_subs(root, patch_subs=url_level)
@@ -1735,11 +1749,14 @@ class TestF01MediaIdentity(FakeTwitterCase):
             args = Args(root, no_summary=True, native_subs=True)
             calls = {"n": 0}
 
-            def flaky(info, url, out_dir, want_lang, retry, download_info=None):
+            def flaky(info, url, out_dir, want_lang, retry, download_info=None,
+                      platform=xsub.PLATFORM_X):
                 calls["n"] += 1
                 if info["id"] == "m-bbb":
                     raise xsub.XsubError("模拟第二个视频失败")
-                return self._subs_per_media(info, url, out_dir, want_lang, retry, download_info)
+                return self._subs_per_media(
+                    info, url, out_dir, want_lang, retry, download_info, platform
+                )
 
             with mock.patch.object(xsub, "fetch_native_subs", side_effect=flaky):
                 with self.assertRaises(xsub.MediaGroupError) as ctx:
@@ -2438,13 +2455,30 @@ class TestRollingAutoCaptions(unittest.TestCase):
                          "普通字幕里重复的句子是真实内容，不该被去重")
 
     def test_a_rolling_track_that_repeats_is_still_collapsed(self):
+        """重抄行的真实形状：它自己**不带**词级标签，新内容才带。"""
         rolling_dup = (
             "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nsame<00:00:01.500><c> line</c>\n\n"
-            "00:00:02.000 --> 00:00:03.000\nsame<00:00:02.500><c> line</c>\n"
+            "00:00:02.000 --> 00:00:03.000\nsame line\n"
         )
         segs = xsub.parse_vtt(rolling_dup)
         self.assertEqual(len(segs), 1)
         self.assertAlmostEqual(segs[0]["end"], 3.0, msg="并段时结束时间要延伸到后一段")
+
+    def test_a_repeated_phrase_that_carries_its_own_word_timings_is_kept(self):
+        """R2-F04：连着说两遍的同一句话，各带各的词级时间，是真实语音不是重绘。
+
+        词级标签是"这些字此刻正在被说出来"的记号。重抄行从来不带它；带标签的那一行
+        永远是本条 cue 的新内容。只按文本相等去重，"No!" "No!" 就会被删掉一句。
+        """
+        vtt = (
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nNo!<00:00:01.500><c> </c>\n\n"
+            "00:00:02.000 --> 00:00:03.000\nNo!<00:00:02.500><c> </c>\n"
+        )
+        segs = xsub.parse_vtt(vtt)
+        self.assertEqual([s["text"] for s in segs], ["No!", "No!"],
+                         "两次都带自己的词级时间 → 两次都是真实语音")
+        self.assertAlmostEqual(segs[0]["end"], 2.0)
+        self.assertAlmostEqual(segs[1]["start"], 2.0)
 
 
 # =========================================================== 第 1 轮审查修复回归
@@ -2549,32 +2583,60 @@ class TestR2F02YouTubeDefaultsToLocal(FakeYouTubeCase):
 
 
 class TestR2F03AutoCaptionsMustBeTheOriginalTrack(unittest.TestCase):
-    """F03：automatic_captions 里出现 -orig 就说明那是"原件 + 一百多条机翻"的扇出，
-    此时同名的 `en` 轨是译件，不能当原文用。"""
+    """F03：YouTube 的 automatic_captions 是"一条原件 + 一百多条机翻"的扇出，
+    只有 `<语言>-orig` 是原件，同名的 `en` 轨可能是译件，不能当原文用。
 
+    第 2 轮加严：这条限制按**平台**生效，不再看表里当时有没有 -orig。"""
+
+    YT = xsub.PLATFORM_YOUTUBE
     JA_VIDEO = {"language": "ja", "automatic_captions": {"en": [{}], "fr": [{}], "ja-orig": [{}]}}
 
     def test_requesting_a_translated_language_falls_back_to_whisper(self):
         self.assertIsNone(
-            xsub.pick_native_lang(self.JA_VIDEO, "en"),
+            xsub.pick_native_lang(self.JA_VIDEO, "en", self.YT),
             "en 轨是从日语机翻过去的，拿它当英文字幕就是二手转述",
         )
 
     def test_requesting_the_original_language_still_works(self):
-        self.assertEqual(xsub.pick_native_lang(self.JA_VIDEO, "ja"), ("ja-orig", "平台自动字幕"))
+        self.assertEqual(
+            xsub.pick_native_lang(self.JA_VIDEO, "ja", self.YT), ("ja-orig", "平台自动字幕")
+        )
 
     def test_spoken_language_is_used_when_no_lang_is_given(self):
-        self.assertEqual(xsub.pick_native_lang(self.JA_VIDEO, None), ("ja-orig", "平台自动字幕"))
+        self.assertEqual(
+            xsub.pick_native_lang(self.JA_VIDEO, None, self.YT), ("ja-orig", "平台自动字幕")
+        )
 
-    def test_track_lists_without_orig_keep_the_old_lenient_matching(self):
-        """X 的字幕表没有 -orig，取轨规则必须逐字不变。"""
+    def test_a_youtube_auto_table_without_orig_is_refused_not_downgraded(self):
+        """R2-F03：门按平台开关，不按"表里有没有 -orig"这个运行期签名。
+
+        yt-dlp 版本、地区、视频年代都会改变那张表的形状。按签名判定，一旦某次
+        返回的表里只剩普通的 `en`，门就自己开了——而那条 `en` 完全可能是机翻。
+        """
+        for table in (
+            {"en": [{}]},
+            {"en": [{}], "en-US": [{}]},
+            {"en-US": [{}], "fr": [{}], "zh-Hans": [{}]},
+        ):
+            info = {"language": "en", "automatic_captions": table}
+            self.assertIsNone(
+                xsub.pick_native_lang(info, None, self.YT),
+                f"{sorted(table)} 里没有 en-orig，YouTube 自动字幕就该退回本地转写",
+            )
+            self.assertIsNone(xsub.pick_native_lang(info, "en", self.YT), sorted(table))
+
+    def test_the_same_table_on_x_keeps_the_old_lenient_matching(self):
+        """同一张表在 X 上必须逐字保持旧行为——严格规则只对 YouTube。"""
         x_like = {"language": "en", "automatic_captions": {"en-US": [{}]}}
         self.assertEqual(xsub.pick_native_lang(x_like, "en"), ("en-US", "平台自动字幕"))
+        self.assertEqual(
+            xsub.pick_native_lang(x_like, "en", xsub.PLATFORM_X), ("en-US", "平台自动字幕")
+        )
 
     def test_manual_subtitles_are_unaffected_by_the_orig_rule(self):
         info = {"language": "ja", "subtitles": {"en": [{}]},
                 "automatic_captions": {"en": [{}], "ja-orig": [{}]}}
-        self.assertEqual(xsub.pick_native_lang(info, "en"), ("en", "平台字幕"),
+        self.assertEqual(xsub.pick_native_lang(info, "en", self.YT), ("en", "平台字幕"),
                          "人工字幕是创作者上传的，不受机翻扇出规则影响")
 
     def test_orig_still_outranks_a_same_name_track_when_not_strict(self):
@@ -2718,10 +2780,47 @@ class TestR2F07AdmissionGate(FakeYouTubeCase):
         with TempDir() as root:
             self.assertEqual(len(self._run(root, allow_long_video=True)), 1)
 
-    def test_a_missing_duration_is_not_treated_as_too_long(self):
+    def test_an_unknown_duration_is_refused_before_any_download(self):
+        """R2-F07：拿不到时长就放行，等于把上限当不存在。
+
+        duration 缺失/非数值/NaN/<=0 全部按"判断不了"处理，一律 fail-closed，
+        并且要在**下载之前**就拒——断言 download_audio 一次都没被调用。
+        """
+        for dur in (None, "3600", float("nan"), float("inf"), 0, -1, True):
+            with self.subTest(duration=dur):
+                self.yt.info.pop("duration", None)
+                if dur is not None:
+                    self.yt.info["duration"] = dur
+                with mock.patch.object(xsub, "download_audio") as dl, TempDir() as root:
+                    with self.assertRaises(xsub.XsubError) as ctx:
+                        self._run(root)
+                    self.assertIn("拿不到这个视频的时长", str(ctx.exception))
+                    self.assertIn("--allow-long-video", str(ctx.exception))
+                    dl.assert_not_called()
+                    self.assertEqual(list(root.iterdir()), [], "拒绝之前不该建任何输出目录")
+
+    def test_the_escape_hatch_is_the_explicit_override_for_an_unknown_duration(self):
         self.yt.info.pop("duration", None)
         with TempDir() as root:
-            self.assertEqual(len(self._run(root)), 1)
+            self.assertEqual(len(self._run(root, allow_long_video=True)), 1)
+
+    def test_the_hard_cap_holds_even_with_the_escape_hatch(self):
+        """R2-F07：--allow-long-video 是"我知道它长"，不是"多长都行"。"""
+        self.yt.info["duration"] = xsub.HARD_MAX_DURATION_SEC + 1
+        with mock.patch.object(xsub, "download_audio") as dl, TempDir() as root:
+            with self.assertRaises(xsub.XsubError) as ctx:
+                self._run(root, allow_long_video=True)
+            self.assertIn("硬上限", str(ctx.exception))
+            dl.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_exactly_at_the_hard_cap_is_allowed_with_the_escape_hatch(self):
+        self.yt.info["duration"] = xsub.HARD_MAX_DURATION_SEC
+        with TempDir() as root:
+            self.assertEqual(len(self._run(root, allow_long_video=True)), 1)
+
+    def test_the_hard_cap_is_strictly_above_the_soft_cap(self):
+        self.assertGreater(xsub.HARD_MAX_DURATION_SEC, xsub.MAX_DURATION_SEC)
 
 
 class TestR2F08VideoIdShape(unittest.TestCase):
@@ -2739,6 +2838,259 @@ class TestR2F08VideoIdShape(unittest.TestCase):
     def test_the_regex_itself_is_anchored_at_both_ends(self):
         self.assertIsNone(xsub.YT_ID_RE.fullmatch("dQw4w9WgXcQ\n"))
         self.assertIsNotNone(xsub.YT_ID_RE.fullmatch("dQw4w9WgXcQ"))
+
+
+# ================================================= 第 2 轮审查修复回归（R2 复审）
+
+
+class TestR3F02XTrackSelectionIsFrozen(unittest.TestCase):
+    """R2-F02：X 的取轨规则必须与冻结基线**逐字相同**。
+
+    第 1 轮为治 YouTube 的机翻扇出而收紧了 pick_native_lang，但那次收紧是**平台无关**的，
+    连带改掉了 X 的行为：没有语言依据时冻结基线取 sorted(langs)[0]，收紧后返回 None
+    → 一条本来直接用平台字幕出结果的推文，改成跑本地 Whisper。
+
+    下面这张表逐条抄自冻结基线 593c15d 的算法，是行为契约本身，不是"当前实现的快照"。
+    """
+
+    # (info, want, 冻结基线的返回值)
+    ORACLE = [
+        # 无 --lang、无 language：人工字幕表取字母序第一条
+        ({"subtitles": {"zh": [{}], "en": [{}], "ar": [{}]}}, None, ("ar", "平台字幕")),
+        # 无 --lang、有 language 且表里有这条：取它
+        ({"subtitles": {"zh": [{}], "en": [{}]}, "language": "zh"}, None, ("zh", "平台字幕")),
+        # 无 --lang、有 language 但表里没有：仍退回字母序第一条（基线不做前缀匹配）
+        ({"subtitles": {"zh": [{}], "en": [{}]}, "language": "fr"}, None, ("en", "平台字幕")),
+        # 人工字幕表为空 → 落到自动字幕表，同样的规则
+        ({"subtitles": {}, "automatic_captions": {"ja": [{}], "en": [{}]}}, None,
+         ("en", "平台自动字幕")),
+        # 指定 --lang：精确优先
+        ({"subtitles": {"en-US": [{}], "en": [{}]}}, "en", ("en", "平台字幕")),
+        # 指定 --lang：没有精确匹配时用同语族前缀
+        ({"subtitles": {"en-US": [{}], "fr": [{}]}}, "en", ("en-US", "平台字幕")),
+        # 指定 --lang：人工字幕表里没有就**跳到**自动字幕表继续找
+        ({"subtitles": {"fr": [{}]}, "automatic_captions": {"en": [{}]}}, "en",
+         ("en", "平台自动字幕")),
+        # 指定 --lang：两张表都没有 → None（交给本地转写）
+        ({"subtitles": {"fr": [{}]}, "automatic_captions": {"de": [{}]}}, "en", None),
+        # -orig 在 X 上没有特殊含义：基线不认它，字母序里 en 排在 en-orig 前面
+        ({"subtitles": {"en-orig": [{}], "en": [{}]}}, None, ("en", "平台字幕")),
+        ({"subtitles": {"en-orig": [{}], "en": [{}]}}, "en", ("en", "平台字幕")),
+        # 两张表都空/缺 → None
+        ({}, None, None),
+        ({"subtitles": {}, "automatic_captions": {}}, "en", None),
+    ]
+
+    def test_every_frozen_case_still_holds_on_x(self):
+        for info, want, expected in self.ORACLE:
+            with self.subTest(info=info, want=want):
+                self.assertEqual(xsub.pick_native_lang(info, want), expected)
+                self.assertEqual(
+                    xsub.pick_native_lang(info, want, xsub.PLATFORM_X), expected
+                )
+
+    def test_the_default_platform_is_x(self):
+        """省略 platform 就是 X：老调用点不写平台也必须落在冻结行为上。"""
+        import inspect
+
+        self.assertEqual(
+            inspect.signature(xsub.pick_native_lang).parameters["platform"].default,
+            xsub.PLATFORM_X,
+        )
+
+    def test_youtube_is_the_only_platform_that_gets_the_strict_rule(self):
+        """严格规则只挂在 YouTube 上，别的平台值一律走冻结路径。"""
+        info = {"subtitles": {"zh": [{}], "ar": [{}]}}
+        self.assertIsNone(xsub.pick_native_lang(info, None, xsub.PLATFORM_YOUTUBE))
+        for other in (xsub.PLATFORM_X, "vimeo", ""):
+            self.assertEqual(
+                xsub.pick_native_lang(info, None, other), ("ar", "平台字幕"), other
+            )
+
+
+class TestR3F02XEndToEndReallyUsesPlatformSubs(FakeTwitterCase):
+    """R2-F02：不打桩 fetch_native_subs，让真实取轨 + 真实字幕下载整条跑通。
+
+    此前 X 的"仍优先平台字幕"只由一个 spy 断言"被调用过"——那证明不了取轨的结果对不对，
+    正是因此第 1 轮把 X 的取轨改坏了也没有测试报警。这里让 transcribe 直接抛异常：
+    只要退回了本地转写就是失败，字幕内容和来源都拿真实产物核对。
+    """
+
+    def _run(self, root, **kw):
+        args = Args(root, no_summary=True, **kw)
+        with mock.patch.object(xsub.shutil, "which", return_value="/usr/bin/ffmpeg"), \
+             mock.patch.object(
+                 xsub, "transcribe",
+                 side_effect=lambda *a: (_ for _ in ()).throw(
+                     AssertionError("X 有平台字幕就不该退回本地转写")
+                 ),
+             ):
+            return xsub.process(FakeTwitter.BASE + "/video/1", args)
+
+    def test_x_default_run_downloads_and_uses_the_platform_track(self):
+        self.tw.ENTRY_EXTRA = {"subtitles": {"en": [{}]}}
+        with TempDir() as root:
+            r = self._run(root)[0]
+            cache = json.loads((r.out_dir / "segments.json").read_text(encoding="utf-8"))
+            self.assertEqual(cache["source"], "平台字幕:en")
+            self.assertIn("字幕属于 m-aaa", (r.out_dir / "transcript.md").read_text("utf-8"))
+
+    def test_with_no_language_evidence_x_still_takes_the_first_track(self):
+        """冻结基线行为：三条人工轨、没有 language，取字母序第一条（ar），不退回转写。"""
+        self.tw.ENTRY_EXTRA = {"subtitles": {"ar": [{}], "en": [{}], "ja": [{}]}}
+        with TempDir() as root:
+            r = self._run(root)[0]
+            cache = json.loads((r.out_dir / "segments.json").read_text(encoding="utf-8"))
+            self.assertEqual(cache["source"], "平台字幕:ar")
+            self.assertEqual(cache["language"], "ar")
+
+    def test_native_subs_flag_is_a_no_op_on_x(self):
+        """X 上 --native-subs 与默认完全等价，产物应当一模一样。"""
+        self.tw.ENTRY_EXTRA = {"subtitles": {"en": [{}]}}
+        with TempDir() as a, TempDir() as b:
+            plain = json.loads(
+                (self._run(a)[0].out_dir / "segments.json").read_text("utf-8")
+            )
+            flagged = json.loads(
+                (self._run(b, native_subs=True)[0].out_dir / "segments.json").read_text("utf-8")
+            )
+            self.assertEqual(plain, flagged)
+
+
+class TestR3F04OrdinaryVttIsParsedExactlyAsBefore(unittest.TestCase):
+    """R2-F04：普通（非滚动）字幕的解析必须与冻结基线**逐字相同**。
+
+    ORACLE 里的期望值抄自冻结基线 593c15d 的 parse_vtt，包括它保留行内多余空白这一点。
+    """
+
+    # (vtt, 冻结基线的 [(start, end, text)])
+    ORACLE = [
+        ("WEBVTT\n\n00:00:01.000 --> 00:00:04.500\nHello world\n",
+         [(1.0, 4.5, "Hello world")]),
+        # 重复的句子在普通字幕里是真实内容，不去重
+        ("WEBVTT\n\n00:00:01.000 --> 00:00:04.500\nHello\n\n"
+         "00:00:04.500 --> 00:00:06.000\nHello\n",
+         [(1.0, 4.5, "Hello"), (4.5, 6.0, "Hello")]),
+        # 多行正文用单个空格接起来
+        ("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nfirst\nsecond\n",
+         [(1.0, 2.0, "first second")]),
+        # 行内/行首行尾的空白照原样留着——那是字幕作者排的版
+        ("WEBVTT\n\n00:00:01.000 --> 00:00:05.000\n   hello   world   \n"
+         "   second   line   \n",
+         [(1.0, 5.0, "hello   world       second   line")]),
+        # 标签去掉，正文留下
+        ("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<v Bob>hi there</v>\n",
+         [(1.0, 2.0, "hi there")]),
+        # 短时间戳写法（mm:ss.mmm）与逗号小数点
+        ("WEBVTT\n\n00:01.000 --> 00:02.000\nshort form\n",
+         [(1.0, 2.0, "short form")]),
+        ("WEBVTT\n\n00:00:01,000 --> 00:00:02,000\ncomma decimal\n",
+         [(1.0, 2.0, "comma decimal")]),
+        # cue settings 跟在时间戳后面
+        ("WEBVTT\n\n00:00:01.000 --> 00:00:02.000 align:start position:0%\npositioned\n",
+         [(1.0, 2.0, "positioned")]),
+        # cue 标识符不是正文
+        ("WEBVTT\n\ncue-1\n00:00:01.000 --> 00:00:02.000\nAlpha\n\n"
+         "cue-2\n00:00:03.000 --> 00:00:04.000\nBravo\n",
+         [(1.0, 2.0, "Alpha"), (3.0, 4.0, "Bravo")]),
+        # 空正文的 cue 不产出段
+        ("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n\n"
+         "00:00:03.000 --> 00:00:04.000\nonly this\n",
+         [(3.0, 4.0, "only this")]),
+    ]
+
+    def test_the_differential_corpus_matches_the_frozen_behaviour(self):
+        for vtt, expected in self.ORACLE:
+            with self.subTest(vtt=vtt):
+                got = [(s["start"], s["end"], s["text"]) for s in xsub.parse_vtt(vtt)]
+                self.assertEqual(got, expected)
+
+    def test_timestamp_shaped_text_in_the_body_is_not_a_cue_boundary(self):
+        """R2-F04：正文里出现时间戳形状的文本是合法的，不能用 search() 去认边界。
+
+        用 search() 会把这一行当成新 cue 的开头：cue 从中间劈开，
+        前半段的正文连同它自己的时间一起消失。
+        """
+        vtt = ("WEBVTT\n\n00:00:01.000 --> 00:00:05.000\n"
+               "he said 00:00:02.000 --> 00:00:03.000 was the timecode\n"
+               "and then left\n")
+        segs = xsub.parse_vtt(vtt)
+        self.assertEqual(len(segs), 1, "整条 cue 必须完整，不能被正文里的时间码劈开")
+        self.assertEqual(segs[0]["start"], 1.0)
+        self.assertEqual(segs[0]["end"], 5.0)
+        self.assertIn("he said", segs[0]["text"])
+        self.assertIn("and then left", segs[0]["text"])
+
+    def test_a_timing_pair_must_start_the_line(self):
+        """时间行的判据：这一行**以**时间戳对开头，后面最多再跟 cue settings。
+
+        "开头"是关键那一半。正文里的时间码总是跟在别的字后面（"他说 00:00:02.000 -->…"），
+        锚在行首就认不上；而一行本身就以时间戳对开头时，按 WebVTT 规范它**就是**时间行——
+        settings 的解析是宽容的（不认识的设置忽略掉），所以后面跟什么都不改变这个判定。
+        """
+        for ok in (
+            "00:00:01.000 --> 00:00:02.000",
+            "00:00:01.000 --> 00:00:02.000 align:start position:0%",
+            "00:00:01.000 --> 00:00:02.000  ",
+            "  00:00:01.000 --> 00:00:02.000",
+            "00:01.000 --> 00:02.000",
+            "00:00:01,000 --> 00:00:02,000",
+        ):
+            self.assertIsNotNone(xsub.VTT_TS_LINE.fullmatch(ok), ok)
+        for bad in (
+            "he said 00:00:01.000 --> 00:00:02.000 was the timecode",
+            "x 00:00:01.000 --> 00:00:02.000",
+            "00:00:01.000",
+            "WEBVTT",
+            "",
+        ):
+            self.assertIsNone(xsub.VTT_TS_LINE.fullmatch(bad), bad)
+
+
+class TestR3F09VideoseriesOnlyBlocksTheEmbedForm(unittest.TestCase):
+    """R2-F09：第 1 轮把 "videoseries" 无条件拒了，但它只在 /embed/ 下有播放列表含义。
+
+    "videoseries" 同时也是一个形态完全合法的 11 位视频 ID，无条件拒会把
+    /watch?v=videoseries 挡在门外，还配一句"这是 /embed/ 链接"的错误说明。
+    """
+
+    def test_the_embed_form_is_still_refused(self):
+        for raw in (
+            "https://www.youtube.com/embed/videoseries?list=PLabcdefghijklmnop",
+            "https://www.youtube-nocookie.com/embed/videoseries?list=PLabcdefghijklmnop",
+            "https://youtube.com/embed/videoseries",
+            "https://www.youtube.com/embed/VideoSeries?list=PLabcdefghijklmnop",
+        ):
+            with self.assertRaises(xsub.XsubError, msg=raw) as ctx:
+                xsub.parse_url(raw)
+            self.assertIn("播放列表", str(ctx.exception))
+
+    def test_every_non_embed_form_accepts_it_as_an_ordinary_id(self):
+        """/embed/ 之外的每一种路径写法都必须放行。
+
+        /shorts/、/live/、/v/ 这三种是关键：它们和 /embed/ 一样有两段路径，
+        所以只有它们能检验出"限定"这件事真的落在 segments[0] == "embed" 上，
+        而不是被前面那句 len(segments) >= 2 顺手挡掉的假象。
+        """
+        for raw in (
+            "https://www.youtube.com/watch?v=videoseries",
+            "https://youtu.be/videoseries",
+            "https://www.youtube.com/shorts/videoseries",
+            "https://www.youtube.com/live/videoseries",
+            "https://www.youtube.com/v/videoseries",
+        ):
+            parsed = xsub.parse_url(raw)
+            self.assertEqual(parsed.post_id, "videoseries", raw)
+            self.assertEqual(parsed.platform, xsub.PLATFORM_YOUTUBE, raw)
+
+    def test_an_ordinary_id_is_untouched(self):
+        """正对照：普通 11 位 ID 一路畅通，拒绝逻辑没有误伤面。"""
+        for raw, vid in (
+            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+            ("https://www.youtube.com/shorts/abc-DEF_123", "abc-DEF_123"),
+        ):
+            self.assertEqual(xsub.parse_url(raw).post_id, vid, raw)
 
 
 if __name__ == "__main__":
