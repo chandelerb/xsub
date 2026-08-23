@@ -2799,10 +2799,34 @@ class TestR2F07AdmissionGate(FakeYouTubeCase):
                     dl.assert_not_called()
                     self.assertEqual(list(root.iterdir()), [], "拒绝之前不该建任何输出目录")
 
-    def test_the_escape_hatch_is_the_explicit_override_for_an_unknown_duration(self):
+    def test_the_escape_hatch_does_not_override_an_unknown_duration(self):
+        """R3-F07：给未知时长开放行口，就是给一条没有上限的路。
+
+        硬上限比的是 duration，而 duration 正是拿不到的那个数——放行之后没有任何
+        可执行的兜底（下载和转写两层都没有独立于 metadata 的字节数或墙钟限制）。
+        所以 --allow-long-video 对未知时长必须无效，且必须在下载之前就拒。
+        """
+        for dur in (None, "3600", float("nan"), float("inf"), 0, -1, True):
+            with self.subTest(duration=dur):
+                self.yt.info.pop("duration", None)
+                if dur is not None:
+                    self.yt.info["duration"] = dur
+                with mock.patch.object(xsub, "download_audio") as dl, TempDir() as root:
+                    with self.assertRaises(xsub.XsubError) as ctx:
+                        self._run(root, allow_long_video=True)
+                    self.assertIn("拿不到这个视频的时长", str(ctx.exception))
+                    dl.assert_not_called()
+                    self.assertEqual(list(root.iterdir()), [], "拒绝之前不该建任何输出目录")
+
+    def test_the_gate_says_plainly_that_the_escape_hatch_will_not_help(self):
+        """报错文案不能把用户支到一个其实无效的开关上。"""
         self.yt.info.pop("duration", None)
         with TempDir() as root:
-            self.assertEqual(len(self._run(root, allow_long_video=True)), 1)
+            with self.assertRaises(xsub.XsubError) as ctx:
+                self._run(root)
+        msg = str(ctx.exception)
+        self.assertIn("--allow-long-video", msg)
+        self.assertIn("不放行", msg)
 
     def test_the_hard_cap_holds_even_with_the_escape_hatch(self):
         """R2-F07：--allow-long-video 是"我知道它长"，不是"多长都行"。"""
@@ -3091,6 +3115,120 @@ class TestR3F09VideoseriesOnlyBlocksTheEmbedForm(unittest.TestCase):
             ("https://www.youtube.com/shorts/abc-DEF_123", "abc-DEF_123"),
         ):
             self.assertEqual(xsub.parse_url(raw).post_id, vid, raw)
+
+
+# ================================================= 第 3 轮审查修复回归（R3 复审）
+
+
+class TestR3F02TheUserFacingContractCannotDrift(unittest.TestCase):
+    """R3-F02：代码改对了，但用户实际读到的那份契约漂了。
+
+    第 3 轮审查指出：模块 docstring 和 README 都已按平台分开写，唯独 argparse 的
+    `--native-subs` 一行仍写着"默认关闭：一律本地 Whisper 转写"——那是**上一个已被
+    推翻的方案**留下的文字，与 X 默认走平台字幕直接相反。用户读 `--help` 形成的预期
+    和真实产物来源不一致，这本身就是缺陷，跟代码对不对无关。
+
+    所以这里锁的不是实现，是三处面向用户的文字**互相之间不许漂**：
+    argparse help、模块 docstring、README。
+    """
+
+    STALE = "一律本地 Whisper"
+
+    @staticmethod
+    def _squash(text: str) -> str:
+        """把空白全部抹掉再比。
+
+        argparse 按 COLUMNS 折行，同一句话在窄终端里会被换行加缩进劈成两截；
+        逐字比对会因为跑测试的终端宽度而时绿时红。这里比的是"这句话在不在"，
+        不是"它排版成什么样"。
+        """
+        return re.sub(r"\s+", "", text)
+
+    def setUp(self):
+        self.help = xsub.build_parser().format_help()
+        self.doc = xsub.__doc__ or ""
+        self.readme = (Path(xsub.__file__).resolve().parent / "README.md").read_text("utf-8")
+
+    @staticmethod
+    def option_help(help_text: str, flag: str) -> str:
+        """把某个选项那一段从 format_help() 里切出来。
+
+        两个坑：选项名在开头的 usage 行里也会出现一次，直接 index() 会切到用法块去；
+        而选项说明又会按终端宽度折行，所以也不能只取一行。这里锚定"行首两空格 + 选项名"
+        找到选项列表里的那一处，再切到下一个同样形状的行首为止。
+        """
+        anchor = f"\n  {flag}"
+        i = help_text.index(anchor)
+        rest = help_text[i + 1 :]
+        j = rest.find("\n  --", 1)
+        return rest[: j if j > 0 else len(rest)]
+
+    def _native_subs_help(self) -> str:
+        return self.option_help(self.help, "--native-subs")
+
+    def test_the_option_help_no_longer_carries_the_withdrawn_default(self):
+        self.assertNotIn(self._squash(self.STALE), self._squash(self._native_subs_help()))
+
+    def test_the_withdrawn_default_is_gone_from_every_user_facing_text(self):
+        for name, text in (("--help", self.help), ("docstring", self.doc), ("README", self.readme)):
+            with self.subTest(where=name):
+                self.assertNotIn(self._squash(self.STALE), self._squash(text))
+
+    def test_the_option_help_names_both_platforms(self):
+        """光删掉错话不够——必须说清楚这个开关对哪个平台有意义。"""
+        seg = self._native_subs_help()
+        self.assertIn("YouTube", seg)
+        self.assertIn("X", seg)
+
+    def test_the_option_help_says_it_is_a_no_op_on_x(self):
+        self.assertIn(self._squash("对 X 不改变任何行为"), self._squash(self._native_subs_help()))
+
+    def test_the_help_and_the_docstring_agree_on_the_x_default(self):
+        self.assertIn(self._squash("X 默认本就优先使用平台字幕"), self._squash(self.help))
+        self.assertIn(self._squash("默认优先用平台自带字幕"), self._squash(self.doc))
+
+    def test_the_help_and_the_docstring_agree_on_the_youtube_default(self):
+        self.assertIn(self._squash("YouTube 默认关闭，走本地 Whisper 转写"), self._squash(self.help))
+        self.assertIn(self._squash("默认本地 Whisper 转写"), self._squash(self.doc))
+
+    def test_the_readme_describes_the_rules_as_per_platform(self):
+        self.assertIn("按平台分开", self.readme)
+
+
+class TestR3F07UnknownDurationHasNoEscapeHatch(unittest.TestCase):
+    """R3-F07：硬上限只能比"已知的 duration"，所以未知时长不能有放行口。
+
+    第 3 轮审查指出：`if not known: ... return` 让 --allow-long-video 直接跳过后面
+    整段，6 小时硬上限在这条路径上根本执行不到，下载和转写两层又都没有独立于
+    metadata 的字节数或墙钟限制——放行等于无上限。既然给不出可执行的兜底，
+    就不给这个放行口。
+
+    这里直接测闸门函数本身，不走整条处理链，把"开关无效"钉在最小单元上。
+    """
+
+    UNKNOWN = (None, "3600", float("nan"), float("inf"), 0, -1, True)
+
+    def test_every_unknown_shape_is_refused_regardless_of_the_flag(self):
+        for dur in self.UNKNOWN:
+            for allow in (False, True):
+                with self.subTest(duration=dur, allow_long=allow):
+                    info = {} if dur is None else {"duration": dur}
+                    with self.assertRaises(xsub.XsubError):
+                        xsub.guard_youtube_admission(info, "dQw4w9WgXcQ", allow)
+
+    def test_a_known_long_duration_still_has_a_working_escape_hatch(self):
+        """负对照：真正该放行的那一档没有被这次收紧误伤。"""
+        info = {"duration": xsub.MAX_DURATION_SEC + 1}
+        with self.assertRaises(xsub.XsubError):
+            xsub.guard_youtube_admission(info, "dQw4w9WgXcQ", False)
+        self.assertIsNone(xsub.guard_youtube_admission(info, "dQw4w9WgXcQ", True))
+
+    def test_the_flag_help_does_not_promise_a_cap_it_cannot_enforce(self):
+        """--help 不能再声称"6 小时硬上限仍生效"——对未知时长那是空头承诺。"""
+        seg = TestR3F02TheUserFacingContractCannotDrift.option_help(
+            xsub.build_parser().format_help(), "--allow-long-video"
+        )
+        self.assertIn("时长未知也不放行", re.sub(r"\s+", "", seg))
 
 
 if __name__ == "__main__":

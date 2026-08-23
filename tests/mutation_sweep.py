@@ -181,6 +181,16 @@ MUTANTS = [
     ("M50 videoseries 的拒绝不再限定 /embed/ 路径",
      '        and segments[0] == "embed"',
      "        and True"),
+    # ---- E1 第 3 轮修（F02：面向用户的文字漂移；F07：未知时长的放行口）
+    ("M51 未知时长又有了放行口（硬上限在这条路上根本执行不到）",
+     "    if not known:",
+     "    if not known and not allow_long:"),
+    ("M52 --native-subs 的说明退回被推翻的旧文案",
+     "这个开关对 X 不改变任何行为。",
+     "默认关闭：一律本地 Whisper 转写。"),
+    ("M53 --allow-long-video 又声称能兜住未知时长",
+     "时长未知也不放行",
+     "时长未知也放行"),
 ]
 
 

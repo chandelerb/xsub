@@ -15,7 +15,7 @@ xsub <链接> --allow-metered-summary   # 明知可能按 API 用量计费也要
 xsub <链接> --cookies           # 仅登录可见的帖子：借用 Chrome 登录态
 xsub <链接> --lang zh           # 强制语言（默认自动识别）
 xsub <链接> --native-subs       # 让 YouTube 也优先用平台自带字幕（X 本来就是这样）
-xsub <链接> --allow-long-video  # 放行超过 2 小时的 YouTube 视频（默认拒绝）
+xsub <链接> --allow-long-video  # 放行 2–6 小时的 YouTube 视频（默认拒绝；时长未知的不放行）
 xsub <链接> --force             # 忽略缓存重跑
 xsub <链接> --open              # 完成后在 Finder 打开
 ```
@@ -91,6 +91,9 @@ X 允许一条推文放多个视频，网页上的链接末尾会带 `/video/1`�
 - 身份指纹里带**平台**字段，所以 X 和 YouTube 的 ID 再怎么撞也不会串到同一份缓存上。
 - **不合适的视频在下载之前就拒**：直播和直播预告没有完整录像可转写；超过 2 小时的视频转写要跑
   很久、摘要那一步还可能超上下文，所以默认拒绝并给出提示，确认要跑加 `--allow-long-video`。
+  这个开关只放行 2–6 小时这一档：超过 6 小时不放行，**时长本身读不出来的也不放行**。
+  后者不是保守——这道闸门唯一能执行的动作就是拿时长跟上限比大小，读不出时长就没有可比的数，
+  放行等于完全没有上限，而下载和转写两层都没有独立于元数据的字节数或时间限制来兜底。
   拒绝发生在建目录和下载之前，不会先落一个空目录再报错。
 
 ### 字幕来源：两个平台的默认不一样
@@ -184,19 +187,19 @@ YouTube（本工具新增的严格规则）：
 ## 自动化测试
 
 ```bash
-python3 tests/test_xsub.py       # 209 个用例
-python3 tests/mutation_sweep.py  # 50 个变异体，必须 50/50 变红
+python3 tests/test_xsub.py       # 220 个用例
+python3 tests/mutation_sweep.py  # 53 个变异体，必须 53/53 变红
 ```
 
-209 个用例，只用 Python 标准库：`yt_dlp` / `mlx_whisper` / `claude` 全部在测试里被假冒，
+220 个用例，只用 Python 标准库：`yt_dlp` / `mlx_whisper` / `claude` 全部在测试里被假冒，
 不联网、不下模型、不产生任何费用。
 
 `mutation_sweep.py` 是「测试的测试」：它把每一条保护单独拆掉一次，看测试会不会变红。
 绿了就说明那条保护没有任何用例盯住，随时可能在下次重构里被悄悄删掉而没人发现。
 它在临时目录里改拷贝，不会动到本仓库。
 
-CI：`.github/workflows/tests.yml` 在每次 push 和 pull request 上跑两步——先是 209 个用例的
-测试套件，然后是 50 个变异体的变异测试（任何一个变异体没被测试抓住就判失败）。两步都必须绿。
+CI：`.github/workflows/tests.yml` 在每次 push 和 pull request 上跑两步——先是 220 个用例的
+测试套件，然后是 53 个变异体的变异测试（任何一个变异体没被测试抓住就判失败）。两步都必须绿。
 只用 Python 标准库，不装依赖、不联网、不下模型。
 
 ## 许可证

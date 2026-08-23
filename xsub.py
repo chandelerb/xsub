@@ -85,7 +85,10 @@ MAX_DURATION_SEC = 2 * 3600
 
 # --allow-long-video 放行的是"比默认长"，不是"无限长"。没有第二道上限，那个开关就等于
 # 把闸门整个拆掉：一场 12 小时的直播回放照样会进来，本地转写跑到天亮。
-# 同时它也是 duration 缺失时的显式 override 边界——放行也只放行到这里为止。
+#
+# 这道上限只对**已知**时长可执行：它比的是 metadata 报出来的 duration。所以时长未知
+# 的输入不能靠它兜底——那种输入根本没有可比的数，放进来就等于无上限。未知时长因此
+# 一律拒绝，见 guard_youtube_admission()。
 HARD_MAX_DURATION_SEC = 6 * 3600
 
 X_HOSTS = frozenset(
@@ -745,12 +748,14 @@ def guard_youtube_admission(info: dict, video_id: str, allow_long: bool) -> None
     分钟之后才在摘要那一步炸掉。两种都在拿到 metadata 的当下就能看出来，
     没有理由让人先等着。
 
-    时长不明（duration 缺失、非数值、NaN/inf、<=0）与"超长"同等对待：判断不了就不放行。
-    放行未知等于把上限整个绕过去——最坏情况和不设上限一模一样，只是多了一层"看起来
-    检查过了"的错觉。想跑就显式加 --allow-long-video 承担后果。
+    时长不明（duration 缺失、非数值、NaN/inf、<=0）**一律拒绝，--allow-long-video 也不放行**。
+    理由是这道闸门唯一能执行的边界就是"拿 duration 和上限比大小"：时长未知时没有可比
+    的数，放行就等于没有任何上限——HARD_MAX_DURATION_SEC 在这条路径上根本无从执行，
+    下载和转写两层也没有独立于 metadata 的字节数或墙钟限制。既然放行之后不存在可执行
+    的兜底，就不提供这个放行。
 
-    即便加了 --allow-long-video，HARD_MAX_DURATION_SEC 这道硬上限仍然生效：
-    显式放行是"我知道它长"，不是"多长都行"。
+    --allow-long-video 只覆盖一种情形：时长已知、且在 MAX_DURATION_SEC 与
+    HARD_MAX_DURATION_SEC 之间。它是"我知道它长"，不是"多长都行"，更不是"多长都不知道也行"。
     """
     status = str(info.get("live_status") or "").strip()
     if info.get("is_live") or status in ("is_live", "is_upcoming", "post_live"):
@@ -769,13 +774,16 @@ def guard_youtube_admission(info: dict, video_id: str, allow_long: bool) -> None
         # 时长未知就放行，等于把上限当不存在：直播回放、分段缺失、yt-dlp 拿不到
         # duration 的畸形条目，全都会以"没超上限"的名义进来，然后在下载和转写上
         # 烧掉几十分钟。拿不到证据时不放行——这是 fail-closed，不是保守。
-        if not allow_long:
-            raise XsubError(
-                f"拿不到这个视频的时长（duration={dur!r}，id={video_id}），无法判断是否超过 "
-                f"{MAX_DURATION_SEC // 3600} 小时上限，拒绝继续。"
-                "确认要跑请加 --allow-long-video（建议同时加 --no-summary）。"
-            )
-        return
+        #
+        # 这里刻意**不看 allow_long**：给未知时长开一个显式放行口，就等于给一条完全
+        # 没有上限的路径。放行之后没有任何可执行的兜底——硬上限比的是 duration，
+        # 而 duration 正是拿不到的那个数。与其提供一个执行不了的承诺，不如不放行。
+        raise XsubError(
+            f"拿不到这个视频的时长（duration={dur!r}，id={video_id}），无法判断是否超过 "
+            f"{MAX_DURATION_SEC // 3600} 小时上限，拒绝继续。"
+            "--allow-long-video 只放行时长已知的长视频，对时长未知的不放行——"
+            "放行了也没有可执行的上限兜底。请改用能正常读出时长的链接，或自行下载并截取音频。"
+        )
     if not allow_long and dur > MAX_DURATION_SEC:
         raise XsubError(
             f"视频时长 {dur / 3600:.1f} 小时，超过 {MAX_DURATION_SEC / 3600:.0f} 小时上限。"
@@ -1981,8 +1989,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--native-subs",
         action="store_true",
-        help="优先使用平台自带字幕（人工字幕优先；自动字幕只认原语言轨，绝不用机翻轨）。"
-        "默认关闭：一律本地 Whisper 转写，结果更稳更准",
+        help="让 YouTube 优先使用平台自带字幕（人工字幕优先；自动字幕只认原语言轨，"
+        "绝不用机翻轨）。X 默认本就优先使用平台字幕，这个开关对 X 不改变任何行为。"
+        f"YouTube 默认关闭，走本地 Whisper 转写",
     )
     ap.add_argument(
         "--allow-metered-summary",
@@ -1998,7 +2007,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--allow-long-video",
         action="store_true",
-        help=f"放行超过 {MAX_DURATION_SEC // 3600} 小时、或时长未知的 YouTube 视频（默认拒绝；{HARD_MAX_DURATION_SEC // 3600} 小时硬上限仍生效）",
+        help=f"放行时长在 {MAX_DURATION_SEC // 3600}–{HARD_MAX_DURATION_SEC // 3600} 小时之间的 YouTube 视频（默认拒绝）。"
+        f"超过 {HARD_MAX_DURATION_SEC // 3600} 小时不放行；时长未知也不放行",
     )
     return ap
 
