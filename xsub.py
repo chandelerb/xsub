@@ -111,6 +111,13 @@ YT_SHORT_HOSTS = frozenset({"youtu.be", "www.youtu.be"})
 YT_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{11}\Z")
 # 路径式的单视频入口。刻意**不含** channel / user / playlist / results 等聚合页。
 YT_PATH_KINDS = frozenset({"shorts", "live", "embed", "v"})
+# /embed/<保留字>：站在视频 ID 那个位置上、却不指向某一个确定视频的字面量。
+# 它们恰好都是 11 位合法字符，能原样通过 ID 形态校验，不列出来就会被当成真 ID 放过去。
+YT_EMBED_RESERVED = {
+    "videoseries": "这是一个播放列表的嵌入链接（/embed/videoseries）",
+    "live_stream": "这是一个频道直播的嵌入链接（/embed/live_stream?channel=…）——它指的是"
+                   "那个频道此刻正在直播的那一场，不是一个确定的视频",
+}
 
 # 认证/权限类错误的判定。必须带词边界：旧版用裸子串 "age"，
 # 会把普通网络错误 "Unable to download webpage" 误判成登录限制，白读一次 Chrome Cookie。
@@ -333,21 +340,20 @@ def parse_youtube_url(raw: str) -> tuple[str, str, int | None]:
     elif len(segments) >= 2 and segments[0] in YT_PATH_KINDS:
         video_id = segments[1]
 
-    if (
-        len(segments) >= 2
-        and segments[0] == "embed"
-        and video_id.lower() == "videoseries"
-    ):
-        # /embed/videoseries?list=<PLAYLIST> 是播放列表的嵌入写法。字面量 "videoseries"
-        # 恰好是 11 位合法字符，能原样通过 ID 形态校验，然后被当成真视频 ID 送去 yt-dlp。
+    if len(segments) >= 2 and segments[0] == "embed":
+        # /embed/videoseries?list=<PL...> 是播放列表的嵌入写法，/embed/live_stream?channel=<UC...>
+        # 是"某频道当前直播"的嵌入写法。两个字面量都恰好 11 位、字符全合法，能原样通过 ID
+        # 形态校验，然后被当成真视频 ID 送去 yt-dlp——而它们指的都不是某一个确定的视频。
         #
-        # 只在 /embed/ 这条路径上拒。"videoseries" 在别处没有这层含义：它同时也是一个
-        # 形态完全合法的 11 位视频 ID，无条件拒会把 /watch?v=videoseries 这样一个
-        # 可能真实存在的视频挡在门外，还给出一句"这是 /embed/ 链接"的错误说明。
-        raise XsubError(
-            "这是一个播放列表的嵌入链接（/embed/videoseries），xsub 一次只处理一个视频。"
-            f"请改用其中单个视频的链接（.../watch?v=<视频ID>）: {raw}"
-        )
+        # 只在 /embed/ 这条路径上拒。这些词在别处没有这层含义：它们同时也是形态完全合法的
+        # 11 位视频 ID，无条件拒会把 /watch?v=live_stream 这样一个可能真实存在的视频挡在
+        # 门外，还给出一句"这是 /embed/ 链接"的错误说明。
+        reserved = YT_EMBED_RESERVED.get(video_id.lower())
+        if reserved:
+            raise XsubError(
+                f"{reserved}，xsub 一次只处理一个视频。"
+                f"请改用其中单个视频的链接（.../watch?v=<视频ID>）: {raw}"
+            )
 
     if not video_id:
         if path.rstrip("/") == "/playlist" or ("list" in query and "v" not in query):
@@ -1077,6 +1083,9 @@ def download_audio(
 # 同一个视频的 automatic_captions 里另有 100+ 条**机器翻译**轨，它们和原语言轨
 # 长得一模一样（都是 `<语言>` 形态），只有 `-orig` 这个后缀能把原件和译件分开。
 ORIG_TRACK_SUFFIX = "-orig"
+# 本地转写的 source 前缀。它同时是缓存里"这份结果是怎么来的"的判据，
+# 见 process_media 里的 stale_fallback。
+WHISPER_SOURCE_PREFIX = "whisper:"
 
 # 字幕来源策略。它决定"这份 segments 是怎么来的"，因此必须进缓存身份（见下）。
 SUBTITLE_POLICY_NATIVE_FIRST = "native-first"  # 有可用平台字幕就直接用，没有才本地转写
@@ -1108,15 +1117,41 @@ def match_lang_track(langs: list[str], target: str, orig_only: bool = False) -> 
     优先级：原语言轨(`xx-orig`) > 精确匹配 > 同语族前缀(en 匹配 en-US)。
     原语言轨排第一：它是 ASR 直出的原件，其余同语言轨可能是从别的语言机翻过来的。
 
-    orig_only=True 时**只认原语言轨**，挑不到就返回 None（调用方退回本地转写）。
+    原语言轨的后缀挂在**完整的**语言代码后面，不是挂在基语言后面：yt-dlp 是拿那条原轨
+    自己的代码拼 `f"{code}-orig"` 的（见 yt_dlp/extractor/youtube/_video.py 的两处
+    `f"{...}-orig"`）。那个代码带不带地区码，取决于 YouTube 给这条轨报的是什么。
+
+    实测（2026-08-24，约 20 条真实视频）YouTube 的 ASR 报的**都是基础码**：
+    en-orig / pt-orig / es-orig / vi-orig，连原声是巴西葡语的视频给出的也是 pt-orig。
+    但同一张表的翻译目标语言那一列**确实带地区码**（真实抓到 pt-PT / zh-Hans / zh-Hant），
+    而 `-orig` 正是拿同一列的代码拼出来的，所以带地区码的原轨在原理上是可能出现的。
+    把 target 截成基语言再拼 `-orig`，这类轨就会被整类漏掉。
+
+    所以原语言轨按"从最贴近 target 到最宽松"分三档找：pt-BR-orig > pt-orig > pt-*-orig。
+    这是严格放宽：第二档就是老写法的行为，pt-BR 照旧能挑到 pt-orig。
+
+    orig_only=True 时**只认原语言轨**（三档都是原轨），挑不到就返回 None，
+    绝不降级到普通轨——那可能是从别的语言机翻过来的。
     """
-    base = target.lower().split("-")[0]
-    orig = [l for l in langs if l.lower() == f"{base}{ORIG_TRACK_SUFFIX}"]
+    want = target.lower()
+    base = want.split("-")[0]
+    exact_orig = [l for l in langs if l.lower() == f"{want}{ORIG_TRACK_SUFFIX}"]
+    base_orig = [l for l in langs if l.lower() == f"{base}{ORIG_TRACK_SUFFIX}"]
+    prefix_orig = [
+        l
+        for l in langs
+        if l.lower().endswith(ORIG_TRACK_SUFFIX)
+        and l.lower()[: -len(ORIG_TRACK_SUFFIX)].split("-")[0] == base
+    ]
+    orig_groups = (exact_orig, base_orig, prefix_orig)
     if orig_only:
-        return sorted(orig)[0] if orig else None
-    exact = [l for l in langs if l.lower() == target.lower()]
+        for group in orig_groups:
+            if group:
+                return sorted(group)[0]
+        return None
+    exact = [l for l in langs if l.lower() == want]
     prefix = [l for l in langs if l.lower().split("-")[0] == base]
-    for group in (orig, exact, prefix):
+    for group in (*orig_groups, exact, prefix):
         if group:
             return sorted(group)[0]
     return None
@@ -1305,6 +1340,31 @@ ROLLING_JOIN_MAX_GAP_SEC = 0.05
 # 滚动窗口同时显示的行数（YouTube 是 2 行），留一行余量
 ROLLING_WINDOW_LINES = 3
 TAG_RE = re.compile(r"<[^>]+>")
+# WebVTT 里除了 cue 还有三种块：NOTE（注释，可以带内容）、STYLE（CSS）、REGION（滚动区定义）。
+# 每一种都从这样一行开始，到下一个**空行**为止，整块都不是字幕，一个字都不该进正文。
+VTT_BLOCK_HEADER = re.compile(r"(?:NOTE(?:[ \t].*)?|STYLE|REGION)[ \t]*")
+
+
+def _vtt_block_lines(lines: list[str]) -> set[int]:
+    """标出属于 NOTE / STYLE / REGION 块的行号。
+
+    只有**块首**才算块首：这三个词必须落在一个块的第一行上（前一行是空行，或者它就是
+    文件第一行）。cue 正文里出现一行普通的英文 "NOTE that ..." 是完全合法的字幕，
+    它前面是时间行或别的正文行、不是空行，因此不会被当成注释块吃掉。
+
+    整块标出来而不是只跳过块首那一行，是因为块里的内容也得排除：NOTE 的正文可以有
+    好几行，STYLE 里是一段 CSS。它们混进上一条 cue 的正文，字幕里就会冒出
+    "::cue { color: red }" 这样的东西。
+    """
+    blocked: set[int] = set()
+    i = 0
+    while i < len(lines):
+        if (i == 0 or lines[i - 1] == "") and VTT_BLOCK_HEADER.fullmatch(lines[i]):
+            while i < len(lines) and lines[i] != "":
+                blocked.add(i)
+                i += 1
+        i += 1
+    return blocked
 
 
 def split_vtt_cues(text: str) -> list[tuple[float, float, list[str]]]:
@@ -1320,18 +1380,35 @@ def split_vtt_cues(text: str) -> list[tuple[float, float, list[str]]]:
     用 search() 就会把这一行当成新 cue 的开头：cue 被从中间劈开，前半段的正文
     连同它自己的时间一起消失。整行匹配（时间戳 + 可选的 cue settings，此外别无他物）
     没有这个歧义。
+
+    正文的**终点**才看空行，而且只认真正的空行（一个字符都没有）：
+      - cue 正文按 WebVTT 就是到第一个空行为止。这一条顺带解决了三样东西——贴在下一条
+        时间戳上面的 cue 标识符、NOTE 注释块、STYLE/REGION 块：它们都在空行之后，
+        本来就不属于这条 cue；
+      - 只含一个空格的行不是空行。滚动字幕拿它表示"滚动窗口的上一行此刻是空的"，
+        按 WebVTT 它也确实是正文的一部分，用 strip() 判空会把一条 cue 从中间劈开；
+      - 缺失空行的手写 vtt 里正文会一直延伸到下一条时间戳行，两个终点取先到的那个。
+
+    NOTE/STYLE/REGION 块还得**先**从时间戳扫描里摘掉（`_vtt_block_lines`）：注释块里
+    照抄一行时间戳形状的文本，不摘就会凭空多出一条 cue。
     """
     lines = [l.rstrip("\r") for l in text.splitlines()]
-    hits = [(i, VTT_TS_LINE.fullmatch(l)) for i, l in enumerate(lines)]
-    ts_at = [(i, m) for i, m in hits if m]
+    blocked = _vtt_block_lines(lines)
+    ts_at: list[tuple[int, re.Match]] = []
+    for i, l in enumerate(lines):
+        if i in blocked:
+            continue
+        m = VTT_TS_LINE.fullmatch(l)
+        if m:
+            ts_at.append((i, m))
     cues: list[tuple[float, float, list[str]]] = []
     for n, (i, m) in enumerate(ts_at):
         stop = ts_at[n + 1][0] if n + 1 < len(ts_at) else len(lines)
-        body = lines[i + 1 : stop]
-        # WebVTT 的 cue 标识符是紧贴下一条时间戳、且与本条正文之间隔着空行的那一行。
-        # 它属于下一条 cue，不是本条的正文。
-        if len(body) >= 2 and body[-1].strip() and not body[-2].strip():
-            body = body[:-1]
+        body: list[str] = []
+        for j in range(i + 1, stop):
+            if lines[j] == "":
+                break
+            body.append(lines[j])
         while body and not body[-1].strip():
             body.pop()
         g = m.groups()
@@ -1927,12 +2004,28 @@ def process_media(target: MediaTarget, args, retry: CookieRetry) -> RunResult:
             log("--force：已清空音频/平台字幕/转写缓存")
 
         cached = None if args.force else load_segments_cache(seg_cache, identity)
-        if cached:
+        # 缓存里存的是**结果**，身份里存的是**意图**。native-first 却存着一份本地转写，
+        # 只说明上一次"想用平台字幕但没拿到"——网络抖了一下、字幕当时还没生成好、
+        # 换了个地区，都会走到这里。把它当成"这个视频没有平台字幕"的永久结论，
+        # 平台字幕恢复之后就永远等不到了，除非人想起来加 --force：一次临时失败
+        # 被缓存固化成了永久降级。所以这一档要再去试一次平台字幕。
+        #
+        # 再试几乎不要钱：fetch_native_subs 先在**已经取到的** info 里挑轨，
+        # 挑不到直接返回，根本不发请求；真有轨才去下那一个 vtt。
+        # 而且就算这次还是没有，也只是沿用缓存里那份转写——绝不会重跑一遍 Whisper。
+        stale_fallback = bool(
+            cached
+            and policy == SUBTITLE_POLICY_NATIVE_FIRST
+            and str(cached[2]).startswith(WHISPER_SOURCE_PREFIX)
+        )
+        if cached and not stale_fallback:
             segs, lang, source = cached
             log(f"转写已缓存: {len(segs)} 段")
         else:
             native = None
             if policy == SUBTITLE_POLICY_NATIVE_FIRST:
+                if stale_fallback:
+                    log("上次没取到平台字幕才退回本地转写，这次再确认一遍平台字幕")
                 native = fetch_native_subs(
                     info, url, out_dir, args.lang, retry, target.download_info, target.platform
                 )
@@ -1945,12 +2038,15 @@ def process_media(target: MediaTarget, args, retry: CookieRetry) -> RunResult:
                     )
             if native:
                 segs, lang, source = native
+            elif stale_fallback:
+                segs, lang, source = cached
+                log(f"平台字幕仍然拿不到，沿用已缓存的本地转写: {len(segs)} 段")
             else:
                 audio = download_audio(
                     url, out_dir, media_identity, retry, provenance, target.download_info
                 )
                 segs, lang = transcribe(audio, args.model, args.lang, vocab_hint(info))
-                source = f"whisper:{args.model.split('/')[-1]}"
+                source = f"{WHISPER_SOURCE_PREFIX}{args.model.split('/')[-1]}"
             if not segs:
                 raise XsubError("没有识别到任何语音内容")
             write_atomic(
